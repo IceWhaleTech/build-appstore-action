@@ -1,0 +1,132 @@
+name: Build ZimaOS AppStore
+description: Build ZimaOS AppStore dist output from source files
+
+inputs:
+  source:
+    description: Source repository root
+    required: false
+    default: .
+  output:
+    description: Output directory
+    required: false
+    default: dist
+  base-url:
+    description: Base URL prefix for generated asset links
+    required: false
+    default: ""
+  cache-file:
+    description: Optional image metadata cache file
+    required: false
+    default: ""
+  digest-cache-file:
+    description: Optional image digest cache file
+    required: false
+    default: ""
+  python-version:
+    description: Python version used to run the build
+    required: false
+    default: "3.11"
+  install-system-deps:
+    description: Install required apt packages on the runner
+    required: false
+    default: "true"
+
+outputs:
+  output-dir:
+    description: Final output directory passed to build_appstore.py
+    value: ${{ steps.outputs-step.outputs.output-dir }}
+  base-url:
+    description: Final base URL used for the build
+    value: ${{ steps.outputs-step.outputs.base-url }}
+
+runs:
+  using: composite
+  steps:
+  - name: Set up Python
+    uses: actions/setup-python@v6
+    with:
+      python-version: ${{ inputs.python-version }}
+
+  - name: Install system dependencies
+    if: ${{ inputs.install-system-deps == 'true' }}
+    shell: bash
+    run: |
+      set -euo pipefail
+      sudo apt-get update
+      sudo apt-get install -y librsvg2-bin
+
+  - name: Install Python dependencies
+    shell: bash
+    run: |
+      set -euo pipefail
+      python -m pip install --upgrade pip
+      pip install -r "${{ github.action_path }}/requirements.txt"
+
+  - name: Normalize base URL
+    id: normalize-base-url
+    shell: bash
+    env:
+      INPUT_BASE_URL: ${{ inputs.base-url }}
+      INPUT_SOURCE: ${{ inputs.source }}
+    run: |
+      set -euo pipefail
+      RAW_BASE_URL="${INPUT_BASE_URL:-}"
+
+      case "$RAW_BASE_URL" in
+        \[*\]\(http://*\)|\[*\]\(https://*\))
+          LINK_LABEL="${RAW_BASE_URL%%]*}"
+          LINK_LABEL="${LINK_LABEL#[}"
+          LINK_TARGET="${RAW_BASE_URL##*\(}"
+          LINK_TARGET="${LINK_TARGET%\)}"
+          if [[ "$LINK_LABEL" == http://* || "$LINK_LABEL" == https://* ]]; then
+            BASE_URL="$LINK_LABEL"
+          else
+            BASE_URL="$LINK_TARGET"
+          fi
+          ;;
+        *)
+          BASE_URL="$RAW_BASE_URL"
+          ;;
+      esac
+
+      if [[ -z "$BASE_URL" ]]; then
+        REPO_URL="$(git -C "${INPUT_SOURCE}" config --get remote.origin.url || true)"
+        if [[ "$REPO_URL" =~ ^https://github.com/([^/]+)/([^/.]+)(\.git)?$ ]]; then
+          OWNER="${BASH_REMATCH[1]}"
+          REPO="${BASH_REMATCH[2]}"
+          BASE_URL="https://cdn.jsdelivr.net/gh/${OWNER}/${REPO}@gh-pages"
+        elif [[ "$REPO_URL" =~ ^git@github.com:([^/]+)/([^/.]+)(\.git)?$ ]]; then
+          OWNER="${BASH_REMATCH[1]}"
+          REPO="${BASH_REMATCH[2]}"
+          BASE_URL="https://cdn.jsdelivr.net/gh/${OWNER}/${REPO}@gh-pages"
+        fi
+      fi
+
+      if [[ -n "$BASE_URL" ]] && [[ ! "$BASE_URL" =~ ^https?://[^[:space:]]+$ ]]; then
+        echo "::error::Invalid base-url input: $RAW_BASE_URL"
+        exit 1
+      fi
+
+      echo "base-url=${BASE_URL}" >> "$GITHUB_OUTPUT"
+
+  - name: Run build_appstore.py
+    shell: bash
+    env:
+      DOCKERHUB_USERNAME: ${{ env.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ env.DOCKERHUB_TOKEN }}
+    run: |
+      set -euo pipefail
+      python "${{ github.action_path }}/scripts/build_appstore.py" \
+        --source "${{ inputs.source }}" \
+        --output "${{ inputs.output }}" \
+        --base-url "${{ steps.normalize-base-url.outputs.base-url }}" \
+        --cache-file "${{ inputs.cache-file }}" \
+        --digest-cache-file "${{ inputs.digest-cache-file }}"
+
+  - name: Export outputs
+    id: outputs-step
+    shell: bash
+    run: |
+      set -euo pipefail
+      echo "output-dir=${{ inputs.output }}" >> "$GITHUB_OUTPUT"
+      echo "base-url=${{ steps.normalize-base-url.outputs.base-url }}" >> "$GITHUB_OUTPUT"
