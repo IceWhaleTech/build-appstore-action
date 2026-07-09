@@ -97,6 +97,14 @@ DOCKER_MANIFEST_ACCEPT = ", ".join([
 IMAGE_SIZE_CACHE = {}
 DIGEST_CACHE_ENTRIES = {}
 IMAGE_DIGEST_CACHE = {}
+BUILD_CACHE_STATS = {
+    "digest_cache_entries_loaded": 0,
+    "digest_cache_hits": 0,
+    "digest_cache_misses": 0,
+    "size_cache_entries_loaded": 0,
+    "size_cache_hits": 0,
+    "size_cache_misses": 0,
+}
 REGISTRY_TOKEN_CACHE = {}
 RATE_LIMITED_REGISTRIES = {}
 RATE_LIMIT_WARNED_REGISTRIES = set()
@@ -282,6 +290,12 @@ def write_build_report(
             "warnings_total": warning_count,
             "dist_exists": dist_exists,
             "locales_total": len(languages),
+            "digest_cache_entries_loaded": BUILD_CACHE_STATS["digest_cache_entries_loaded"],
+            "digest_cache_hits": BUILD_CACHE_STATS["digest_cache_hits"],
+            "digest_cache_misses": BUILD_CACHE_STATS["digest_cache_misses"],
+            "size_cache_entries_loaded": BUILD_CACHE_STATS["size_cache_entries_loaded"],
+            "size_cache_hits": BUILD_CACHE_STATS["size_cache_hits"],
+            "size_cache_misses": BUILD_CACHE_STATS["size_cache_misses"],
         },
         "context": {
             "repo": os.getenv("GITHUB_REPOSITORY", ""),
@@ -560,6 +574,7 @@ def load_digest_cache(cache_file):
     for cache_key, image_value in entries.items():
         if isinstance(cache_key, str) and isinstance(image_value, str) and image_value.strip():
             IMAGE_DIGEST_CACHE[cache_key] = image_value.strip()
+    BUILD_CACHE_STATS["digest_cache_entries_loaded"] = len(IMAGE_DIGEST_CACHE)
 
 
 def save_digest_cache():
@@ -606,10 +621,12 @@ def resolve_image_to_digest(image_ref, architecture):
     cache_key = get_cache_key(image_ref, architecture)
     cached = IMAGE_DIGEST_CACHE.get(cache_key)
     if cached:
+        BUILD_CACHE_STATS["digest_cache_hits"] += 1
         digest = cached.split("@", 1)[1] if "@" in cached else None
         if digest:
             DIGEST_CACHE_ENTRIES.setdefault(image_ref, digest)
         return cached
+    BUILD_CACHE_STATS["digest_cache_misses"] += 1
 
     try:
         manifest_payload, response_headers, manifest_parsed = fetch_registry_manifest(image_ref)
@@ -783,6 +800,7 @@ def load_image_size_cache(cache_file):
         parsed = deserialize_image_descriptors(descriptors)
         if parsed:
             IMAGE_SIZE_CACHE[str(cache_key)] = parsed
+    BUILD_CACHE_STATS["size_cache_entries_loaded"] = len(IMAGE_SIZE_CACHE)
 
 
 def save_image_size_cache():
@@ -1023,8 +1041,11 @@ def calculate_min_image_size(compose_data, app_id, architecture):
             cache_key = get_cache_key(image_ref, architecture)
             descriptors = IMAGE_SIZE_CACHE.get(cache_key)
             if descriptors is None:
+                BUILD_CACHE_STATS["size_cache_misses"] += 1
                 descriptors = estimate_image_blob_descriptors(image_ref, architecture)
                 update_image_size_cache_entry(image_ref, architecture, descriptors)
+            else:
+                BUILD_CACHE_STATS["size_cache_hits"] += 1
             for digest, size in descriptors:
                 if digest in seen:
                     continue
