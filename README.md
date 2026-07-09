@@ -9,6 +9,7 @@ This composite GitHub Action wraps [`scripts/build_appstore.py`](./scripts/build
 - optionally installs required Ubuntu system packages
 - normalizes `base-url`
 - runs `build_appstore.py`
+- optionally writes a structured `build-report.json`
 
 ## Runner support
 
@@ -23,6 +24,8 @@ This action currently targets `ubuntu-latest` or other Debian/Ubuntu-based runne
 | `base-url` | No | `""` | Base URL prefix for generated asset links |
 | `cache-file` | No | `""` | Optional image metadata cache file |
 | `digest-cache-file` | No | `""` | Optional image digest cache file |
+| `report-json` | No | `""` | Optional structured build report JSON output path |
+| `report-title` | No | `Build V2 Store Report` | Optional title used in the structured build report |
 | `python-version` | No | `3.11` | Python version used to run the build |
 | `install-system-deps` | No | `true` | Whether to install `librsvg2-bin` via `apt-get` |
 
@@ -32,6 +35,8 @@ This action currently targets `ubuntu-latest` or other Debian/Ubuntu-based runne
 |---|---|
 | `output-dir` | Final output directory passed to `build_appstore.py` |
 | `base-url` | Final base URL used for the build |
+| `report-json` | Structured build report JSON path when enabled |
+| `status` | Build status captured for the run |
 
 ## Secrets and environment
 
@@ -64,10 +69,16 @@ jobs:
           base-url: https://cdn.jsdelivr.net/gh/${{ github.repository }}@gh-pages
           cache-file: .cache/build_appstore/image-size-cache.json
           digest-cache-file: .cache/build_appstore/image-digest-cache.json
+          report-json: out/build-v2-report.json
+          report-title: Build V2 Store Report
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
 ```
+
+If `report-json` is set, the action writes a machine-readable build report even when
+the build fails. Workflows can then render HTML reports, write job summaries, or
+upload the JSON as an artifact.
 
 ## Publishing as a public action
 
