@@ -441,8 +441,9 @@ def format_architecture_list(architectures):
     return ", ".join(sorted(architectures))
 
 
-def flush_app_warnings(app_id):
-    """Emit aggregated warnings for one app and clear them from memory."""
+def flush_app_warnings(app_id, compose_input_path):
+    """Emit aggregated warnings for one app, clear them, and return report issues."""
+    warning_issues = []
     digest_keys = [key for key in PENDING_DIGEST_WARNINGS if key[0] == app_id]
     for key in sorted(digest_keys):
         _, service_name, image_ref, error_text = key
@@ -451,6 +452,22 @@ def flush_app_warnings(app_id):
             f"  WARN  App '{app_id}' could not pin image digest for "
             f"service '{service_name}' on architectures [{architectures}]: "
             f"{image_ref} ({error_text})"
+        )
+        warning_issues.append(
+            make_issue(
+                "warning",
+                "IMAGE_DIGEST_PIN_FAILED",
+                compose_input_path,
+                (
+                    f"App '{app_id}' could not pin image digest for service "
+                    f"'{service_name}' on architectures [{architectures}]."
+                ),
+                (
+                    "Check registry availability and ensure the image tag exists. "
+                    "If this is transient, rerun the workflow after refreshing the digest cache."
+                ),
+                details=f"{image_ref} ({error_text})",
+            )
         )
 
     image_size_keys = [key for key in PENDING_IMAGE_SIZE_WARNINGS if key[0] == app_id]
@@ -462,6 +479,24 @@ def flush_app_warnings(app_id):
             f"service '{service_name}' on architectures [{architectures}]: "
             f"{image_ref} ({error_text})"
         )
+        warning_issues.append(
+            make_issue(
+                "warning",
+                "IMAGE_SIZE_ESTIMATE_FAILED",
+                compose_input_path,
+                (
+                    f"App '{app_id}' could not estimate image size for service "
+                    f"'{service_name}' on architectures [{architectures}]."
+                ),
+                (
+                    "Check registry availability and ensure the image manifest is accessible. "
+                    "If this is transient, rerun the workflow after refreshing the size cache."
+                ),
+                details=f"{image_ref} ({error_text})",
+            )
+        )
+
+    return warning_issues
 
 
 def registry_json_request(url, headers=None, registry=None):
@@ -1988,7 +2023,7 @@ def main():
                     "content_hash": chash,
                     "index_locales": index_locales,
                 })
-                flush_app_warnings(app_id)
+                issues.extend(flush_app_warnings(app_id, compose_input_path))
                 apps_built += 1
                 print(f"  OK   {app_id}")
 
