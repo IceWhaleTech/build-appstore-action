@@ -34,6 +34,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -196,7 +197,107 @@ def parse_args():
         default="",
         help="Optional JSON cache file for image digest metadata (default: <source>/.cache/build_appstore/image-digest-cache.json)",
     )
+    parser.add_argument(
+        "--report-json",
+        default="",
+        help="Optional JSON file to write a structured build report to.",
+    )
+    parser.add_argument(
+        "--report-title",
+        default="Build V2 Store Report",
+        help="Title used in the structured build report.",
+    )
     return parser.parse_args()
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def make_issue(severity, code, file_path, message, suggestion, details=""):
+    payload = {
+        "severity": severity,
+        "code": code,
+        "file": str(file_path or ""),
+        "message": message,
+        "suggestion": suggestion,
+    }
+    if details:
+        payload["details"] = details
+    return payload
+
+
+def write_build_report(
+    report_path,
+    report_title,
+    status,
+    started_at,
+    source,
+    output,
+    base_url,
+    apps_total,
+    apps_built,
+    apps_failed,
+    apps_skipped,
+    languages,
+    issues,
+):
+    if not report_path:
+        return
+
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    dist_exists = output.exists()
+    error_count = sum(1 for issue in issues if issue.get("severity") == "error")
+    warning_count = sum(1 for issue in issues if issue.get("severity") == "warning")
+
+    artifacts = [
+        {
+            "name": "build-v2-report.json",
+            "path": report_path.as_posix(),
+            "note": "Upload this file as a workflow artifact for debugging and summary rendering.",
+        }
+    ]
+    if dist_exists:
+        artifacts.append(
+            {
+                "name": "dist",
+                "path": output.as_posix(),
+                "note": "Upload the generated v2 store output as a workflow artifact.",
+            }
+        )
+
+    report = {
+        "title": report_title,
+        "kind": "build-v2",
+        "status": status,
+        "started_at": started_at,
+        "finished_at": now_iso(),
+        "summary": {
+            "apps_total": apps_total,
+            "apps_built": apps_built,
+            "apps_failed": apps_failed,
+            "apps_skipped": apps_skipped,
+            "issues_total": len(issues),
+            "errors_total": error_count,
+            "warnings_total": warning_count,
+            "dist_exists": dist_exists,
+            "locales_total": len(languages),
+        },
+        "context": {
+            "repo": os.getenv("GITHUB_REPOSITORY", ""),
+            "ref": os.getenv("GITHUB_REF", ""),
+            "sha": os.getenv("GITHUB_SHA", ""),
+            "trigger": os.getenv("GITHUB_EVENT_NAME", ""),
+            "source": source.as_posix(),
+            "output": output.as_posix(),
+            "base_url": base_url,
+        },
+        "issues": issues,
+        "artifacts": artifacts,
+    }
+
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"Build report written to {report_path}")
 
 
 def content_hash(*parts):
@@ -1497,11 +1598,14 @@ def parse_app(app_dir):
     try:
         compose_data = yaml.safe_load(raw_content)
     except yaml.YAMLError as e:
-        print(f"  YAML ERROR: {app_dir.name}: {e}", file=sys.stderr)
-        return None
+        raise ValueError(
+            f"App '{app_dir.name}' has invalid YAML in {compose_path}: {e}"
+        ) from e
 
     if not compose_data or not isinstance(compose_data, dict):
-        return None
+        raise ValueError(
+            f"App '{app_dir.name}' has an empty or invalid compose document in {compose_path}."
+        )
     if "x-casaos" not in compose_data:
         return None
 
@@ -1701,6 +1805,15 @@ def main():
         if args.digest_cache_file
         else default_digest_cache_file(source)
     )
+    report_path = Path(args.report_json).resolve() if args.report_json else None
+    started_at = now_iso()
+    issues = []
+    apps_total = 0
+    apps_built = 0
+    apps_failed = 0
+    apps_skipped = 0
+    languages = []
+    status = "success"
 
     print(f"Source: {source}")
     print(f"Output: {output}")
@@ -1713,257 +1826,345 @@ def main():
     )
     print()
 
-    load_image_size_cache(cache_file)
-    load_digest_cache(digest_cache_file)
+    try:
+        load_image_size_cache(cache_file)
+        load_digest_cache(digest_cache_file)
 
-    if output.exists():
-        shutil.rmtree(output)
-    output.mkdir(parents=True)
+        if output.exists():
+            shutil.rmtree(output)
+        output.mkdir(parents=True)
 
-    apps_dir = source / "Apps"
-    if not apps_dir.exists():
-        print(f"Error: Apps directory not found at {apps_dir}", file=sys.stderr)
-        sys.exit(1)
+        apps_dir = source / "Apps"
+        if not apps_dir.exists():
+            raise FileNotFoundError(f"Apps directory not found at {apps_dir}")
 
-    languages = load_supported_languages(source)
-    supported_locales = set(languages)
-    print(f"Languages (candidate): {len(languages)} ({', '.join(languages)})")
-    print()
+        languages = load_supported_languages(source)
+        supported_locales = set(languages)
+        print(f"Languages (candidate): {len(languages)} ({', '.join(languages)})")
+        print()
 
-    store_config = load_store_config(source)
-    if store_config:
-        print(f"  STORE {store_config.get('store_id', '(unknown)')}")
-    else:
-        print(f"  WARN  {STORE_CONFIG_FILE} not found, skipping store.json")
+        store_config = load_store_config(source)
+        if store_config:
+            print(f"  STORE {store_config.get('store_id', '(unknown)')}")
+        else:
+            print(f"  WARN  {STORE_CONFIG_FILE} not found, skipping store.json")
 
-    print("\n── Processing apps ──")
-    app_records = []
-    skipped = []
+        print("\n── Processing apps ──")
+        app_records = []
+        skipped = []
 
-    for app_dir in sorted(apps_dir.iterdir()):
-        if not app_dir.is_dir():
-            continue
+        for app_dir in sorted(apps_dir.iterdir()):
+            if not app_dir.is_dir():
+                continue
+            apps_total += 1
 
-        try:
-            result = parse_app(app_dir)
-        except ValueError as exc:
-            print(f"  WARN  {exc}", file=sys.stderr)
-            sys.exit(1)
-        if result is None:
-            skipped.append(app_dir.name)
-            print(f"  SKIP {app_dir.name}")
-            continue
+            compose_input_path = app_dir / "docker-compose.yml"
+            if not compose_input_path.exists():
+                compose_input_path = app_dir / "docker-compose.yaml"
 
-        app_id, compose_data, meta, original_xcasaos = result
-
-        try:
-            app_output = output / "apps" / app_id
-            assets_output = app_output / "assets"
-            copied_images, image_mapping, icon_filename = process_app_assets(
-                source,
-                app_dir,
-                assets_output,
-                original_xcasaos,
-                meta,
-            )
-
-            assets_path = f"/apps/{app_id}/assets"
-
-            min_memory = calculate_min_memory(compose_data)
-            architectures = get_supported_architectures(original_xcasaos)
-            min_image_size = {}
-
-            compose_default = copy.deepcopy(compose_data)
-            compose_xc = compose_default.get("x-casaos", {})
-            compose_xc["icon"] = url_join(base_url, f"{assets_path}/{icon_filename}")
-            compose_default["x-casaos"] = compose_xc
-
-            app_output.mkdir(parents=True, exist_ok=True)
-            compose_content = yaml.dump(
-                compose_default,
-                default_flow_style=False,
-                allow_unicode=True,
-                sort_keys=False,
-            )
-            compose_path = app_output / "docker-compose.yml"
-            compose_path.write_text(compose_content, encoding="utf-8")
-
-            for architecture in architectures:
-                compose_arch = copy.deepcopy(compose_default)
-                pin_service_images_to_digests(compose_arch, app_id, architecture)
-                min_image_size[architecture] = calculate_min_image_size(
-                    compose_arch,
-                    app_id,
-                    architecture,
+            try:
+                result = parse_app(app_dir)
+            except ValueError as exc:
+                apps_failed += 1
+                message = str(exc)
+                issues.append(
+                    make_issue(
+                        "error",
+                        "INVALID_APP_METADATA",
+                        compose_input_path,
+                        message,
+                        "Fix the reported metadata field in the app compose file and re-run the build.",
+                    )
                 )
-                compose_arch_content = yaml.dump(
-                    compose_arch,
+                print(f"  ERROR {message}", file=sys.stderr)
+                continue
+
+            if result is None:
+                apps_skipped += 1
+                skipped.append(app_dir.name)
+                print(f"  SKIP {app_dir.name}")
+                continue
+
+            app_id, compose_data, meta, original_xcasaos = result
+
+            try:
+                app_output = output / "apps" / app_id
+                assets_output = app_output / "assets"
+                copied_images, image_mapping, icon_filename = process_app_assets(
+                    source,
+                    app_dir,
+                    assets_output,
+                    original_xcasaos,
+                    meta,
+                )
+
+                assets_path = f"/apps/{app_id}/assets"
+
+                min_memory = calculate_min_memory(compose_data)
+                architectures = get_supported_architectures(original_xcasaos)
+                min_image_size = {}
+
+                compose_default = copy.deepcopy(compose_data)
+                compose_xc = compose_default.get("x-casaos", {})
+                compose_xc["icon"] = url_join(base_url, f"{assets_path}/{icon_filename}")
+                compose_default["x-casaos"] = compose_xc
+
+                app_output.mkdir(parents=True, exist_ok=True)
+                compose_content = yaml.dump(
+                    compose_default,
                     default_flow_style=False,
                     allow_unicode=True,
                     sort_keys=False,
                 )
-                compose_arch_path = app_output / f"docker-compose.{architecture}.yml"
-                compose_arch_path.write_text(compose_arch_content, encoding="utf-8")
-        except ArchitectureMismatchError as exc:
-            print(f"  ERROR {exc}", file=sys.stderr)
-            sys.exit(1)
+                compose_path = app_output / "docker-compose.yml"
+                compose_path.write_text(compose_content, encoding="utf-8")
 
-        meta_default = build_meta_payload(
-            meta,
-            DEFAULT_LOCALE,
-            assets_path,
-            copied_images,
-            image_mapping,
-            base_url,
-            title_i18n=original_xcasaos.get("title"),
-            strict=False,
-            min_memory=min_memory,
-            min_image_size=min_image_size,
-            app_id=app_id,
-            source_version=str(original_xcasaos.get("version", "")).strip(),
-        )
-        meta_default_content = json.dumps(to_json_safe(meta_default), ensure_ascii=False, indent=2)
-        (app_output / "meta.json").write_text(meta_default_content, encoding="utf-8")
+                for architecture in architectures:
+                    compose_arch = copy.deepcopy(compose_default)
+                    pin_service_images_to_digests(compose_arch, app_id, architecture)
+                    min_image_size[architecture] = calculate_min_image_size(
+                        compose_arch,
+                        app_id,
+                        architecture,
+                    )
+                    compose_arch_content = yaml.dump(
+                        compose_arch,
+                        default_flow_style=False,
+                        allow_unicode=True,
+                        sort_keys=False,
+                    )
+                    compose_arch_path = app_output / f"docker-compose.{architecture}.yml"
+                    compose_arch_path.write_text(compose_arch_content, encoding="utf-8")
 
-        meta_locales = collect_locales_from_i18n(meta)
-        meta_locales = {
-            loc for loc in meta_locales
-            if loc in supported_locales and loc != DEFAULT_LOCALE
-        }
-        for locale in sorted(meta_locales):
-            meta_locale = build_meta_i18n_overlay(
-                app_id,
-                meta,
-                locale,
-                title_i18n=original_xcasaos.get("title"),
-            )
-            write_json(app_output / f"meta.{locale}.json", meta_locale)
+                meta_default = build_meta_payload(
+                    meta,
+                    DEFAULT_LOCALE,
+                    assets_path,
+                    copied_images,
+                    image_mapping,
+                    base_url,
+                    title_i18n=original_xcasaos.get("title"),
+                    strict=False,
+                    min_memory=min_memory,
+                    min_image_size=min_image_size,
+                    app_id=app_id,
+                    source_version=str(original_xcasaos.get("version", "")).strip(),
+                )
+                meta_default_content = json.dumps(to_json_safe(meta_default), ensure_ascii=False, indent=2)
+                (app_output / "meta.json").write_text(meta_default_content, encoding="utf-8")
 
-        chash = hash_directory_files(app_output)
+                meta_locales = collect_locales_from_i18n(meta)
+                meta_locales = {
+                    loc for loc in meta_locales
+                    if loc in supported_locales and loc != DEFAULT_LOCALE
+                }
+                for locale in sorted(meta_locales):
+                    meta_locale = build_meta_i18n_overlay(
+                        app_id,
+                        meta,
+                        locale,
+                        title_i18n=original_xcasaos.get("title"),
+                    )
+                    write_json(app_output / f"meta.{locale}.json", meta_locale)
 
-        index_locales = collect_locales_from_i18n(
-            original_xcasaos,
-            fields=INDEX_I18N_FIELDS,
-            nested_fields=set(),
-        )
-        index_locales = {
-            loc for loc in index_locales
-            if loc in supported_locales and loc != DEFAULT_LOCALE
-        }
+                chash = hash_directory_files(app_output)
 
-        app_records.append({
-            "app_id": app_id,
-            "original_xcasaos": original_xcasaos,
-            "assets_path": assets_path,
-            "icon_filename": icon_filename,
-            "thumbnail": meta_default.get("thumbnail", ""),
-            "content_hash": chash,
-            "index_locales": index_locales,
-        })
-        flush_app_warnings(app_id)
-        print(f"  OK   {app_id}")
+                index_locales = collect_locales_from_i18n(
+                    original_xcasaos,
+                    fields=INDEX_I18N_FIELDS,
+                    nested_fields=set(),
+                )
+                index_locales = {
+                    loc for loc in index_locales
+                    if loc in supported_locales and loc != DEFAULT_LOCALE
+                }
 
-    app_records.sort(key=lambda x: x["app_id"])
+                app_records.append({
+                    "app_id": app_id,
+                    "original_xcasaos": original_xcasaos,
+                    "assets_path": assets_path,
+                    "icon_filename": icon_filename,
+                    "thumbnail": meta_default.get("thumbnail", ""),
+                    "content_hash": chash,
+                    "index_locales": index_locales,
+                })
+                flush_app_warnings(app_id)
+                apps_built += 1
+                print(f"  OK   {app_id}")
 
-    print("\n── Generating store/index files ──")
+            except ArchitectureMismatchError as exc:
+                apps_failed += 1
+                message = str(exc)
+                issues.append(
+                    make_issue(
+                        "error",
+                        "ARCHITECTURE_MISMATCH",
+                        compose_input_path,
+                        message,
+                        "Fix `x-casaos.architectures` or switch to container images that publish the required architectures.",
+                    )
+                )
+                print(f"  ERROR {message}", file=sys.stderr)
+            except Exception as exc:
+                apps_failed += 1
+                error_text = str(exc)
+                if "failed to resolve icon" in error_text or "failed to resolve thumbnail" in error_text or "failed to resolve screenshot_link" in error_text:
+                    code = "ASSET_RESOLUTION_FAILED"
+                    suggestion = "Check the referenced icon, thumbnail, or screenshot paths/URLs and make sure the assets exist."
+                else:
+                    code = "APP_BUILD_FAILED"
+                    suggestion = "Inspect the build log details for this app, then fix the reported compose, metadata, asset, or registry issue."
+                issues.append(
+                    make_issue(
+                        "error",
+                        code,
+                        compose_input_path,
+                        f"App '{app_id}' failed during build processing.",
+                        suggestion,
+                        details=error_text,
+                    )
+                )
+                print(f"  ERROR App '{app_id}' failed: {error_text}", file=sys.stderr)
 
-    if store_config:
-        store_default = {
-            "version": store_config.get("version", 2),
-            "store_id": store_config.get("store_id", ""),
-            "name": resolve_i18n(store_config.get("name", ""), DEFAULT_LOCALE),
-            "description": resolve_i18n(store_config.get("description", ""), DEFAULT_LOCALE),
-            "maintainer": store_config.get("maintainer", ""),
-            "url": store_config.get("url", ""),
-        }
-        write_json(output / "store.json", store_default)
+        app_records.sort(key=lambda x: x["app_id"])
 
-        store_locales = set()
-        for field in ("name", "description"):
-            value = store_config.get(field)
-            if isinstance(value, dict):
-                store_locales.update(value.keys())
-        store_locales = {
-            loc for loc in store_locales
-            if loc in supported_locales and loc != DEFAULT_LOCALE
-        }
+        print("\n── Generating store/index files ──")
 
-        for locale in sorted(store_locales):
-            store_locale = build_store_i18n_overlay(store_config, locale)
-            write_json(output / f"store.{locale}.json", store_locale)
-            print(f"  store.{locale}.json")
+        if store_config:
+            store_default = {
+                "version": store_config.get("version", 2),
+                "store_id": store_config.get("store_id", ""),
+                "name": resolve_i18n(store_config.get("name", ""), DEFAULT_LOCALE),
+                "description": resolve_i18n(store_config.get("description", ""), DEFAULT_LOCALE),
+                "maintainer": store_config.get("maintainer", ""),
+                "url": store_config.get("url", ""),
+            }
+            write_json(output / "store.json", store_default)
 
-    default_entries = []
-    for record in app_records:
-        app_id = record["app_id"]
-        default_entries.append(
-            build_index_entry(
-                app_id=app_id,
-                original_xcasaos=record["original_xcasaos"],
-                locale=DEFAULT_LOCALE,
-                assets_path=record["assets_path"],
-                icon_filename=record["icon_filename"],
-                thumbnail=record["thumbnail"],
-                compose_url=f"/apps/{app_id}/docker-compose.yml",
-                meta_url=f"/apps/{app_id}/meta.json",
-                content_hash_value=record["content_hash"],
-                strict=False,
-            )
-        )
+            store_locales = set()
+            for field in ("name", "description"):
+                value = store_config.get(field)
+                if isinstance(value, dict):
+                    store_locales.update(value.keys())
+            store_locales = {
+                loc for loc in store_locales
+                if loc in supported_locales and loc != DEFAULT_LOCALE
+            }
 
-    index_default = {
-        "version": 2,
-        "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "app_count": len(default_entries),
-        "base_url": normalize_base_url(base_url),
-        "apps": default_entries,
-    }
-    write_json(output / "index.json", index_default)
+            for locale in sorted(store_locales):
+                store_locale = build_store_i18n_overlay(store_config, locale)
+                write_json(output / f"store.{locale}.json", store_locale)
+                print(f"  store.{locale}.json")
 
-    candidate_index_locales = set()
-    for record in app_records:
-        candidate_index_locales.update(record["index_locales"])
-
-    for locale in sorted(candidate_index_locales):
-        locale_entries = []
+        default_entries = []
         for record in app_records:
-            if locale not in record["index_locales"]:
-                continue
             app_id = record["app_id"]
-            entry = build_index_i18n_overlay_entry(
-                app_id=app_id,
-                original_xcasaos=record["original_xcasaos"],
-                locale=locale,
+            default_entries.append(
+                build_index_entry(
+                    app_id=app_id,
+                    original_xcasaos=record["original_xcasaos"],
+                    locale=DEFAULT_LOCALE,
+                    assets_path=record["assets_path"],
+                    icon_filename=record["icon_filename"],
+                    thumbnail=record["thumbnail"],
+                    compose_url=f"/apps/{app_id}/docker-compose.yml",
+                    meta_url=f"/apps/{app_id}/meta.json",
+                    content_hash_value=record["content_hash"],
+                    strict=False,
+                )
             )
-            # Keep sparse locale files: id + explicitly translated i18n fields only.
-            if len(entry) > 1:
-                locale_entries.append(entry)
 
-        if not locale_entries:
-            continue
+        index_default = {
+            "version": 2,
+            "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "app_count": len(default_entries),
+            "base_url": normalize_base_url(base_url),
+            "apps": default_entries,
+        }
+        write_json(output / "index.json", index_default)
 
-        index_locale = {"apps": locale_entries}
-        write_json(output / f"index.{locale}.json", index_locale)
-        print(f"  index.{locale}.json ({len(locale_entries)} apps)")
+        candidate_index_locales = set()
+        for record in app_records:
+            candidate_index_locales.update(record["index_locales"])
 
-    write_digest_cache(output / "store" / "digest_cache.txt")
+        for locale in sorted(candidate_index_locales):
+            locale_entries = []
+            for record in app_records:
+                if locale not in record["index_locales"]:
+                    continue
+                app_id = record["app_id"]
+                entry = build_index_i18n_overlay_entry(
+                    app_id=app_id,
+                    original_xcasaos=record["original_xcasaos"],
+                    locale=locale,
+                )
+                if len(entry) > 1:
+                    locale_entries.append(entry)
 
-    print(f"\n{'=' * 50}")
-    print(f"Done! {len(app_records)} apps")
-    print(f"Output: {output}/")
-    print("  index.json")
-    print("  index.{locale}.json (only when locale is explicitly defined)")
-    print("  store.json / store.{locale}.json")
-    print("  apps/{app_id}/docker-compose.yml")
-    print("  apps/{app_id}/docker-compose.{architecture}.yml")
-    print("  apps/{app_id}/meta.json / meta.{locale}.json")
-    print("  apps/{app_id}/assets/*")
-    if skipped:
-        print(f"  Skipped: {', '.join(skipped)}")
+            if not locale_entries:
+                continue
 
-    save_image_size_cache()
-    save_digest_cache()
+            index_locale = {"apps": locale_entries}
+            write_json(output / f"index.{locale}.json", index_locale)
+            print(f"  index.{locale}.json ({len(locale_entries)} apps)")
+
+        write_digest_cache(output / "store" / "digest_cache.txt")
+
+        print(f"\n{'=' * 50}")
+        print(f"Done! {len(app_records)} apps")
+        print(f"Output: {output}/")
+        print("  index.json")
+        print("  index.{locale}.json (only when locale is explicitly defined)")
+        print("  store.json / store.{locale}.json")
+        print("  apps/{app_id}/docker-compose.yml")
+        print("  apps/{app_id}/docker-compose.{architecture}.yml")
+        print("  apps/{app_id}/meta.json / meta.{locale}.json")
+        print("  apps/{app_id}/assets/*")
+        if skipped:
+            print(f"  Skipped: {', '.join(skipped)}")
+
+        if any(issue.get("severity") == "error" for issue in issues):
+            status = "failed"
+        elif any(issue.get("severity") == "warning" for issue in issues):
+            status = "warning"
+
+    except Exception as exc:
+        status = "failed"
+        details = traceback.format_exc()
+        message = str(exc) or exc.__class__.__name__
+        issues.append(
+            make_issue(
+                "error",
+                "BUILD_V2_FAILED",
+                "",
+                message,
+                "Check the workflow log for the failing build step, then fix the reported app metadata, compose file, asset, or registry error.",
+                details=details,
+            )
+        )
+        print(f"ERROR: {message}", file=sys.stderr)
+        print(details, file=sys.stderr)
+    finally:
+        save_image_size_cache()
+        save_digest_cache()
+        write_build_report(
+            report_path=report_path,
+            report_title=args.report_title,
+            status=status,
+            started_at=started_at,
+            source=source,
+            output=output,
+            base_url=base_url,
+            apps_total=apps_total,
+            apps_built=apps_built,
+            apps_failed=apps_failed,
+            apps_skipped=apps_skipped,
+            languages=languages,
+            issues=issues,
+        )
+
+    return 1 if status == "failed" else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

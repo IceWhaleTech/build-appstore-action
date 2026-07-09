@@ -137,20 +137,9 @@ runs:
         --output "${{ inputs.output }}" \
         --base-url "${{ steps.normalize-base-url.outputs.base-url }}" \
         --cache-file "${{ inputs.cache-file }}" \
-        --digest-cache-file "${{ inputs.digest-cache-file }}"
-
-  - name: Write build report
-    if: ${{ inputs.report-json != '' }}
-    shell: bash
-    run: |
-      set -euo pipefail
-      python3 "${{ github.action_path }}/scripts/write_build_report.py" \
+        --digest-cache-file "${{ inputs.digest-cache-file }}" \
         --report-json "${{ inputs.report-json }}" \
-        --report-title "${{ inputs.report-title }}" \
-        --source "${{ inputs.source }}" \
-        --output "${{ inputs.output }}" \
-        --base-url "${{ steps.normalize-base-url.outputs.base-url }}" \
-        --build-outcome "${{ steps.run-build.outcome }}"
+        --report-title "${{ inputs.report-title }}"
 
   - name: Fail if build failed
     if: ${{ steps.run-build.outcome != 'success' }}
