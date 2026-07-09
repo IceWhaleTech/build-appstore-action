@@ -108,6 +108,7 @@ BUILD_CACHE_STATS = {
 REGISTRY_TOKEN_CACHE = {}
 RATE_LIMITED_REGISTRIES = {}
 RATE_LIMIT_WARNED_REGISTRIES = set()
+PENDING_RATE_LIMIT_WARNINGS = {}
 PENDING_DIGEST_WARNINGS = {}
 PENDING_IMAGE_SIZE_WARNINGS = {}
 REGISTRY_MANIFEST_CACHE = {}
@@ -431,6 +432,7 @@ def warn_registry_rate_limited_once(app_id, registry, image_ref, operation):
     if not registry or registry in RATE_LIMIT_WARNED_REGISTRIES:
         return
     RATE_LIMIT_WARNED_REGISTRIES.add(registry)
+    PENDING_RATE_LIMIT_WARNINGS[(app_id, registry, image_ref, operation)] = True
     print(
         f"  WARN  App '{app_id}' {operation} for image '{image_ref}' because "
         f"registry '{registry}' is rate-limited; remaining images from this "
@@ -458,6 +460,30 @@ def format_architecture_list(architectures):
 def flush_app_warnings(app_id, compose_input_path):
     """Emit aggregated warnings for one app, clear them, and return report issues."""
     warning_issues = []
+    rate_limit_keys = [key for key in PENDING_RATE_LIMIT_WARNINGS if key[0] == app_id]
+    for key in sorted(rate_limit_keys):
+        _, registry, image_ref, operation = key
+        PENDING_RATE_LIMIT_WARNINGS.pop(key, None)
+        warning_issues.append(
+            make_issue(
+                "warning",
+                "REGISTRY_RATE_LIMITED",
+                compose_input_path,
+                (
+                    f"App '{app_id}' {operation} because registry "
+                    f"'{registry}' is rate-limited."
+                ),
+                (
+                    "Retry later, authenticate to Docker Hub if possible, or pre-warm "
+                    "the digest/size caches to reduce live registry requests."
+                ),
+                details=(
+                    f"Image: {image_ref}. Remaining images from registry '{registry}' "
+                    "were skipped for the rest of this build run."
+                ),
+            )
+        )
+
     digest_keys = [key for key in PENDING_DIGEST_WARNINGS if key[0] == app_id]
     for key in sorted(digest_keys):
         _, service_name, image_ref, error_text = key
