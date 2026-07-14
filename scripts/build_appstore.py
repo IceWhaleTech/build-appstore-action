@@ -32,6 +32,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import traceback
@@ -137,6 +138,10 @@ REVERSE_DOMAIN_APP_ID_PATTERN = re.compile(
 
 class ArchitectureMismatchError(RuntimeError):
     """Raised when an app declares an architecture unsupported by its image."""
+
+
+class DuplicateAppIdError(RuntimeError):
+    """Raised when multiple apps declare the same x-casaos.id."""
 
 
 def normalize_safe_id(value):
@@ -250,6 +255,8 @@ def write_build_report(
     apps_skipped,
     languages,
     issues,
+    metadata_bundle_path=None,
+    metadata_bundle_checksum_path=None,
 ):
     if not report_path:
         return
@@ -272,6 +279,22 @@ def write_build_report(
                 "name": "dist",
                 "path": output.as_posix(),
                 "note": "Upload the generated v2 store output as a workflow artifact.",
+            }
+        )
+    if metadata_bundle_path and metadata_bundle_path.exists():
+        artifacts.append(
+            {
+                "name": metadata_bundle_path.name,
+                "path": metadata_bundle_path.as_posix(),
+                "note": "Bootstrap bundle containing generated JSON/YML metadata files for first-time store caching.",
+            }
+        )
+    if metadata_bundle_checksum_path and metadata_bundle_checksum_path.exists():
+        artifacts.append(
+            {
+                "name": metadata_bundle_checksum_path.name,
+                "path": metadata_bundle_checksum_path.as_posix(),
+                "note": "SHA-256 checksum for the bootstrap metadata bundle.",
             }
         )
 
@@ -323,6 +346,43 @@ def content_hash(*parts):
             p = p.encode("utf-8")
         h.update(p)
     return h.hexdigest()[:8]
+
+
+def file_sha256(path):
+    """Compute the SHA-256 checksum of a file."""
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def create_metadata_bundle(output_dir, bundle_name="metadata.tar.gz", checksum_name="metadata.sha256"):
+    """Archive generated JSON/YML metadata files for faster first-time bootstrap."""
+    bundle_path = output_dir / bundle_name
+    checksum_path = output_dir / checksum_name
+    metadata_files = sorted(
+        path for path in output_dir.rglob("*")
+        if path.is_file() and path.suffix.lower() in {".json", ".yml", ".yaml"}
+    )
+    if not metadata_files:
+        raise ValueError(f"No metadata files found in {output_dir} to include in {bundle_name}.")
+
+    with tarfile.open(bundle_path, "w:gz") as archive:
+        for path in metadata_files:
+            arcname = path.relative_to(output_dir).as_posix()
+            tar_info = archive.gettarinfo(str(path), arcname=arcname)
+            tar_info.mtime = 0
+            tar_info.uid = 0
+            tar_info.gid = 0
+            tar_info.uname = ""
+            tar_info.gname = ""
+            with path.open("rb") as f:
+                archive.addfile(tar_info, f)
+
+    bundle_checksum = file_sha256(bundle_path)
+    checksum_path.write_text(f"{bundle_checksum}  {bundle_path.name}\n", encoding="utf-8")
+    return bundle_path, checksum_path, len(metadata_files)
 
 
 def registry_request(url, headers=None):
@@ -1896,6 +1956,8 @@ def main():
     apps_skipped = 0
     languages = []
     status = "success"
+    metadata_bundle_path = None
+    metadata_bundle_checksum_path = None
 
     print(f"Source: {source}")
     print(f"Output: {output}")
@@ -1934,6 +1996,7 @@ def main():
         print("\n── Processing apps ──")
         app_records = []
         skipped = []
+        seen_app_ids = {}
 
         for app_dir in sorted(apps_dir.iterdir()):
             if not app_dir.is_dir():
@@ -1968,6 +2031,27 @@ def main():
                 continue
 
             app_id, compose_data, meta, original_xcasaos = result
+            if app_id in seen_app_ids:
+                apps_failed += 1
+                first_compose_path = seen_app_ids[app_id]
+                message = (
+                    f"Duplicate x-casaos.id '{app_id}' detected in "
+                    f"{first_compose_path} and {compose_input_path}. "
+                    "Each app must use a globally unique x-casaos.id to avoid "
+                    "output path collisions."
+                )
+                issues.append(
+                    make_issue(
+                        "error",
+                        "DUPLICATE_APP_ID",
+                        compose_input_path,
+                        message,
+                        "Ensure every app uses a unique `x-casaos.id` before re-running the build.",
+                    )
+                )
+                print(f"  ERROR {message}", file=sys.stderr)
+                raise DuplicateAppIdError(message)
+            seen_app_ids[app_id] = compose_input_path
 
             try:
                 app_output = output / "apps" / app_id
@@ -2191,6 +2275,15 @@ def main():
             print(f"  index.{locale}.json ({len(locale_entries)} apps)")
 
         write_digest_cache(output / "store" / "digest_cache.txt")
+        (
+            metadata_bundle_path,
+            metadata_bundle_checksum_path,
+            metadata_bundle_files,
+        ) = create_metadata_bundle(output)
+        print(
+            f"  {metadata_bundle_path.name} ({metadata_bundle_files} metadata files)"
+        )
+        print(f"  {metadata_bundle_checksum_path.name}")
 
         print(f"\n{'=' * 50}")
         print(f"Done! {len(app_records)} apps")
@@ -2202,6 +2295,8 @@ def main():
         print("  apps/{app_id}/docker-compose.{architecture}.yml")
         print("  apps/{app_id}/meta.json / meta.{locale}.json")
         print("  apps/{app_id}/assets/*")
+        print(f"  {metadata_bundle_path.name}")
+        print(f"  {metadata_bundle_checksum_path.name}")
         if skipped:
             print(f"  Skipped: {', '.join(skipped)}")
 
@@ -2210,6 +2305,9 @@ def main():
         elif any(issue.get("severity") == "warning" for issue in issues):
             status = "warning"
 
+    except DuplicateAppIdError as exc:
+        status = "failed"
+        print(f"ERROR: {exc}", file=sys.stderr)
     except Exception as exc:
         status = "failed"
         details = traceback.format_exc()
@@ -2243,6 +2341,8 @@ def main():
             apps_skipped=apps_skipped,
             languages=languages,
             issues=issues,
+            metadata_bundle_path=metadata_bundle_path,
+            metadata_bundle_checksum_path=metadata_bundle_checksum_path,
         )
 
     return 1 if status == "failed" else 0

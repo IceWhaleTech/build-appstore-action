@@ -9,6 +9,7 @@ This composite GitHub Action wraps [`scripts/build_appstore.py`](./scripts/build
 - optionally installs required Ubuntu system packages
 - normalizes `base-url`
 - runs `build_appstore.py`
+- creates a bootstrap metadata bundle containing all generated `json`/`yml` files
 - optionally writes a structured `build-report.json`
 
 ## Runner support
@@ -34,6 +35,8 @@ This action currently targets `ubuntu-latest` or other Debian/Ubuntu-based runne
 | Name | Description |
 |---|---|
 | `output-dir` | Final output directory passed to `build_appstore.py` |
+| `metadata-bundle` | Path to the generated bootstrap metadata tarball |
+| `metadata-bundle-sha256` | Path to the checksum file for the bootstrap metadata tarball |
 | `base-url` | Final base URL used for the build |
 | `report-json` | Structured build report JSON path when enabled |
 | `status` | Build status captured for the run |
@@ -79,6 +82,23 @@ jobs:
 If `report-json` is set, the action writes a machine-readable build report even when
 the build fails. Workflows can then render HTML reports, write job summaries, or
 upload the JSON as an artifact.
+
+## Bootstrap metadata bundle
+
+Each successful build now also generates:
+
+- `dist/metadata.tar.gz`
+- `dist/metadata.sha256`
+
+The tarball contains every generated `*.json`, `*.yml`, and `*.yaml` file under
+`dist/`, while preserving relative paths. This is intended for first-time store
+bootstrap, where downloading one compressed metadata bundle is faster than fetching
+many small files individually.
+
+A recommended client flow is:
+
+1. On first add, download and extract `metadata.tar.gz`, then verify it with `metadata.sha256`.
+2. After the local cache exists, continue using `index.json` and each app's `content_hash` for incremental refreshes.
 
 ## Publishing as a public action
 

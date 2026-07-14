@@ -43,6 +43,12 @@ outputs:
   output-dir:
     description: Final output directory passed to build_appstore.py
     value: ${{ steps.outputs-step.outputs.output-dir }}
+  metadata-bundle:
+    description: Path to the generated bootstrap metadata tarball
+    value: ${{ steps.outputs-step.outputs.metadata-bundle }}
+  metadata-bundle-sha256:
+    description: Path to the SHA-256 checksum file for the bootstrap metadata tarball
+    value: ${{ steps.outputs-step.outputs.metadata-bundle-sha256 }}
   base-url:
     description: Final base URL used for the build
     value: ${{ steps.outputs-step.outputs.base-url }}
@@ -159,6 +165,8 @@ runs:
         STATUS="failed"
       fi
       echo "output-dir=${{ inputs.output }}" >> "$GITHUB_OUTPUT"
+      echo "metadata-bundle=${{ inputs.output }}/metadata.tar.gz" >> "$GITHUB_OUTPUT"
+      echo "metadata-bundle-sha256=${{ inputs.output }}/metadata.sha256" >> "$GITHUB_OUTPUT"
       echo "base-url=${{ steps.normalize-base-url.outputs.base-url }}" >> "$GITHUB_OUTPUT"
       echo "report-json=${{ inputs.report-json }}" >> "$GITHUB_OUTPUT"
       echo "status=${STATUS}" >> "$GITHUB_OUTPUT"
